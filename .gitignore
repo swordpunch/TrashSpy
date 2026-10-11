@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+Output/
+*.spec
+deletion_log.db
+exe_icon_check.*
