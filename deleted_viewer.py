@@ -37,6 +37,9 @@ FSCTL_QUERY_USN_JOURNAL = 0x900F4  # == _ctl_code(9, 61, 0, 0)
 FSCTL_ENUM_USN_DATA = _ctl_code(9, 44, 3, 0)  # 0x900B3
 FSCTL_READ_USN_JOURNAL = _ctl_code(9, 46, 3, 0)  # 0x900BB
 USN_REASON_FILE_DELETE = 0x200
+USN_REASON_RENAME_OLD = 0x1000
+USN_REASON_RENAME_NEW = 0x2000
+USN_READ_MASK = USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD | USN_REASON_RENAME_NEW
 ATTR_DIRECTORY = 0x10
 ERROR_HANDLE_EOF = 38
 FRN_INDEX_MASK = 0xFFFFFFFFFFFF  # low 48 bits of FRN = MFT index (root = 5)
@@ -214,13 +217,14 @@ def _scan_volume_usn(letter, progress=None):
             enum_in.StartFileReferenceNumber = nxt
             if progress:
                 progress(S("map_progress", L=letter, n=total))
-        # 2) deletion records from the journal.
-        # The journal wraps quickly on busy systems, so re-query it right
-        # before reading and retry once from fresh state on failure.
+        # 2) deletion + rename records from the journal.
+        # Renames into $Recycle.Bin let us map cryptic $R names back to the
+        # original file names when the bin is emptied later.
         found = {}
+        renames = {}
         for attempt in (1, 2):
             jd = _query_journal(h, letter)
-            read_in = _ReadUsnData(jd.FirstUsn, USN_REASON_FILE_DELETE, 0, 0, 0,
+            read_in = _ReadUsnData(jd.FirstUsn, USN_READ_MASK, 0, 0, 0,
                                    jd.UsnJournalID)
             end_usn = jd.NextUsn
             guard = 0
@@ -247,6 +251,16 @@ def _scan_volume_usn(letter, progress=None):
                         prev = found.get(key)
                         if prev is None or r["ts"] > prev["ts"]:
                             found[key] = r
+                    if r["reason"] & (USN_REASON_RENAME_OLD | USN_REASON_RENAME_NEW):
+                        slot = renames.get(r["fid"])
+                        if slot is None:
+                            slot = renames[r["fid"]] = {}
+                        if r["reason"] & USN_REASON_RENAME_OLD:
+                            if slot.get("old") is None or r["ts"] > slot["old"]["ts"]:
+                                slot["old"] = r
+                        if r["reason"] & USN_REASON_RENAME_NEW:
+                            if slot.get("new") is None or r["ts"] > slot["new"]["ts"]:
+                                slot["new"] = r
                 read_in.StartUsn = nxt
                 if progress:
                     progress(S("journal_progress", L=letter, n=len(found)))
@@ -261,11 +275,11 @@ def _scan_volume_usn(letter, progress=None):
                 ent = low_map.get(fid[0])
             return ent
 
-        items = []
-        for (parent, name), r in found.items():
+        def resolve(pid, name, seed):
+            """Returns (path, broken). Follows parent chain up to volume root."""
             parts = [name]
-            cur, broken = r["pid"], False
-            seen = {r["fid"]}
+            cur, broken = pid, False
+            seen = {seed}
             while _frn_index(cur[0]) not in (0, 5) and cur not in seen:
                 seen.add(cur)
                 ent = lookup(cur)
@@ -278,6 +292,48 @@ def _scan_volume_usn(letter, progress=None):
             path = f"{letter}:\\" + "\\".join(parts)
             if broken:
                 path = f"{letter}:\\…\\" + "\\".join(parts)
+            return path, broken
+
+        def under_bin(pid):
+            """If pid is a $Recycle.Bin SID dir, return True."""
+            ent = lookup(pid)
+            if ent is None:
+                return False
+            g = lookup(ent[0])
+            return g is not None and g[1] == "$Recycle.Bin"
+
+        # map (bin dir low FRN, $R suffix) -> (orig name, orig path)
+        bin_map = {}
+        for fid, slot in renames.items():
+            old, new = slot.get("old"), slot.get("new")
+            if old is None or new is None:
+                continue
+            if not new["name"].startswith("$R") or not under_bin(new["pid"]):
+                continue
+            opath, _ = resolve(old["pid"], old["name"], old["fid"])
+            bin_map[(new["pid"][0], new["name"][2:])] = (old["name"], opath)
+
+        items = []
+        for (parent, name), r in found.items():
+            is_bin = under_bin(r["pid"])
+            if is_bin and name.startswith("$I"):
+                continue  # recycle bin metadata, not a real file
+            if is_bin and name.startswith("$R"):
+                hit = bin_map.get((r["pid"][0], name[2:]))
+                if hit is not None:
+                    oname, opath = hit
+                    dname = f"{oname} {S('via_bin')}"
+                    try:
+                        dt = filetime_to_local(r["ts"])
+                    except Exception:
+                        dt = None
+                    items.append({"name": dname, "deleted": dt, "path": opath,
+                                  "drive": letter + ":",
+                                  "is_dir": bool(r["attrs"] & ATTR_DIRECTORY)})
+                    continue
+                # rename record already aged out of the small journal —
+                # fall through and show the raw $R entry
+            path, _ = resolve(r["pid"], name, r["fid"])
             try:
                 dt = filetime_to_local(r["ts"])
             except Exception:
