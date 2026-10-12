@@ -169,19 +169,27 @@ def _parse_usn_buffer(buf, n):
     return recs, nxt
 
 
+def _query_journal(h, letter):
+    jd = _UsnJournalData()
+    ret = wintypes.DWORD(0)
+    ok = _k32.DeviceIoControl(h, FSCTL_QUERY_USN_JOURNAL, None, 0,
+                              ctypes.byref(jd), ctypes.sizeof(jd),
+                              ctypes.byref(ret), None)
+    if not ok:
+        raise OSError(S("vol_no_usn", L=letter))
+    return jd
+
+
 def _scan_volume_usn(letter, progress=None):
     """Returns list of dicts(name, deleted, path, drive, is_dir) for one volume."""
     h = _open_volume(letter)
     try:
-        jd = _UsnJournalData()
-        ret = wintypes.DWORD(0)
-        ok = _k32.DeviceIoControl(h, FSCTL_QUERY_USN_JOURNAL, None, 0,
-                                  ctypes.byref(jd), ctypes.sizeof(jd),
-                                  ctypes.byref(ret), None)
-        if not ok:
-            raise OSError(S("vol_no_usn", L=letter))
+        _query_journal(h, letter)  # check journal exists
         out = ctypes.create_string_buffer(1024 * 1024)
-        # 1) ID -> (parent ID, name) maps of current files (for path resolution)
+        ret = wintypes.DWORD(0)
+        # 1) ID -> (parent ID, name) maps of current DIRECTORIES only.
+        # Ancestors of any path are always dirs, so this is enough and
+        # much faster (dirs are a small fraction of all files).
         frn_map = {}
         low_map = {}
         enum_in = _MFTEnumData(0, 0, 0x7FFFFFFFFFFFFFFF, 2, 4)
@@ -199,40 +207,52 @@ def _scan_volume_usn(letter, progress=None):
             if not recs:
                 break
             for r in recs:
-                frn_map[r["fid"]] = (r["pid"], r["name"])
-                low_map[r["fid"][0]] = (r["pid"], r["name"])
+                if r["attrs"] & ATTR_DIRECTORY:
+                    frn_map[r["fid"]] = (r["pid"], r["name"])
+                    low_map[r["fid"][0]] = (r["pid"], r["name"])
             total += len(recs)
             enum_in.StartFileReferenceNumber = nxt
             if progress:
                 progress(S("map_progress", L=letter, n=total))
-        # 2) deletion records from the journal
-        read_in = _ReadUsnData(jd.FirstUsn, USN_REASON_FILE_DELETE, 0, 0, 0, jd.UsnJournalID)
-        end_usn = jd.NextUsn
+        # 2) deletion records from the journal.
+        # The journal wraps quickly on busy systems, so re-query it right
+        # before reading and retry once from fresh state on failure.
         found = {}
-        guard = 0
-        while guard < 20000:
-            guard += 1
-            ok = _k32.DeviceIoControl(h, FSCTL_READ_USN_JOURNAL, ctypes.byref(read_in),
-                                      ctypes.sizeof(read_in), out, len(out),
-                                      ctypes.byref(ret), None)
-            if not ok:
-                if _k32.GetLastError() == ERROR_HANDLE_EOF:
+        for attempt in (1, 2):
+            jd = _query_journal(h, letter)
+            read_in = _ReadUsnData(jd.FirstUsn, USN_REASON_FILE_DELETE, 0, 0, 0,
+                                   jd.UsnJournalID)
+            end_usn = jd.NextUsn
+            guard = 0
+            failed = False
+            while guard < 20000:
+                guard += 1
+                ok = _k32.DeviceIoControl(h, FSCTL_READ_USN_JOURNAL, ctypes.byref(read_in),
+                                          ctypes.sizeof(read_in), out, len(out),
+                                          ctypes.byref(ret), None)
+                if not ok:
+                    if _k32.GetLastError() == ERROR_HANDLE_EOF:
+                        break
+                    if attempt == 1:
+                        failed = True
+                        break  # retry with a fresh query
+                    raise OSError(S("vol_journal_err", L=letter))
+                n = ret.value
+                recs, nxt = _parse_usn_buffer(out, n)
+                if not recs:
                     break
-                raise OSError(S("vol_journal_err", L=letter))
-            n = ret.value
-            recs, nxt = _parse_usn_buffer(out, n)
-            if not recs:
-                break
-            for r in recs:
-                if r["reason"] & USN_REASON_FILE_DELETE:
-                    key = (r["parent"], r["name"])
-                    prev = found.get(key)
-                    if prev is None or r["ts"] > prev["ts"]:
-                        found[key] = r
-            read_in.StartUsn = nxt
-            if progress:
-                progress(S("journal_progress", L=letter, n=len(found)))
-            if nxt >= end_usn:
+                for r in recs:
+                    if r["reason"] & USN_REASON_FILE_DELETE:
+                        key = (r["parent"], r["name"])
+                        prev = found.get(key)
+                        if prev is None or r["ts"] > prev["ts"]:
+                            found[key] = r
+                read_in.StartUsn = nxt
+                if progress:
+                    progress(S("journal_progress", L=letter, n=len(found)))
+                if nxt >= end_usn:
+                    break
+            if not failed:
                 break
         # 3) resolve full paths
         def lookup(fid):
@@ -423,6 +443,8 @@ class App(tk.Tk):
         self.geometry("860x560")
         db_init()
         self._refresh_after = None
+        self.usn_items = []
+        self.usn_warn = []
         self.monitor = Monitor(
             on_delete=lambda n: self.after(0, self.schedule_refresh),
             on_status=lambda t: self.after(0, lambda: self.scan_label.config(text=t)))
@@ -490,6 +512,15 @@ class App(tk.Tk):
         self.btn_open_recent.pack(side="left", padx=6)
         self.usn_status = ttk.Label(f3, text="")
         self.usn_status.pack(anchor="w", pady=2)
+        srow = ttk.Frame(f3)
+        srow.pack(fill="x", pady=(0, 4))
+        self.usn_search = ttk.Entry(srow)
+        self.usn_search.pack(side="left", fill="x", expand=True)
+        self.usn_search.bind("<KeyRelease>", lambda e: self.apply_usn_filter())
+        self.usn_search.bind("<FocusIn>", lambda e: self._search_focus(True))
+        self.usn_search.bind("<FocusOut>", lambda e: self._search_focus(False))
+        self.btn_usn_clear = ttk.Button(srow, text="", command=self.clear_usn_search)
+        self.btn_usn_clear.pack(side="left", padx=6)
         cols3 = ("name", "deleted", "path", "drive")
         self.usn_tree = ttk.Treeview(f3, columns=cols3, show="headings")
         for c, w in [("name", 220), ("deleted", 150), ("path", 380), ("drive", 80)]:
@@ -529,6 +560,9 @@ class App(tk.Tk):
         self.btn_scan.config(text=S("btn_scan"))
         self.btn_run_admin.config(text=S("btn_run_admin"))
         self.btn_open_recent.config(text=S("btn_open_folder"))
+        self.btn_usn_clear.config(text=S("btn_clear"))
+        if not self.usn_search.get():
+            self.usn_search.insert(0, S("search_ph"))
         for c, key in [("name", "col_name"), ("deleted", "col_deleted"),
                        ("path", "col_path"), ("watched", "col_watched")]:
             self.hist_tree.heading(c, text=S(key))
@@ -589,14 +623,47 @@ class App(tk.Tk):
             return
 
         def done():
-            for r in items:
-                dt = r["deleted"].strftime("%Y-%m-%d %H:%M") if r["deleted"] else "?"
-                self.usn_tree.insert("", "end", values=(r["name"], dt, r["path"], r["drive"]))
-            msg = S("found_fmt", n=len(items))
-            if warnings:
-                msg += " | " + " | ".join(warnings)
-            self.usn_status.config(text=msg)
+            self.usn_items = items
+            self.usn_warn = warnings
+            self.apply_usn_filter()
         self.after(0, done)
+
+    def _search_query(self):
+        q = self.usn_search.get().strip()
+        if not q or q == S("search_ph"):
+            return ""
+        return q.lower()
+
+    def _search_focus(self, focused):
+        if focused:
+            if self.usn_search.get() == S("search_ph"):
+                self.usn_search.delete(0, "end")
+        elif not self.usn_search.get().strip():
+            self.usn_search.delete(0, "end")
+            self.usn_search.insert(0, S("search_ph"))
+
+    def clear_usn_search(self):
+        self.usn_search.delete(0, "end")
+        self.usn_search.insert(0, S("search_ph"))
+        self.apply_usn_filter()
+
+    def apply_usn_filter(self):
+        for i in self.usn_tree.get_children():
+            self.usn_tree.delete(i)
+        items = getattr(self, "usn_items", [])
+        warnings = getattr(self, "usn_warn", [])
+        q = self._search_query()
+        shown = 0
+        for r in items:
+            if q and q not in r["name"].lower() and q not in r["path"].lower():
+                continue
+            dt = r["deleted"].strftime("%Y-%m-%d %H:%M") if r["deleted"] else "?"
+            self.usn_tree.insert("", "end", values=(r["name"], dt, r["path"], r["drive"]))
+            shown += 1
+        msg = S("found_fmt", n=len(items)) + " | " + S("shown_fmt", n=shown)
+        if warnings:
+            msg += " | " + " | ".join(warnings)
+        self.usn_status.config(text=msg)
 
     def open_selected(self, tree):
         sel = tree.selection()
